@@ -144,6 +144,7 @@ kbd,code{background:var(--bg);border:1px solid var(--line);border-radius:4px;pad
 .copy-row{display:flex;gap:6px}
 .ct-row{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
 .chart-box{position:relative;height:340px}
+.dropzone{position:fixed;inset:12px;border:3px dashed var(--accent);border-radius:18px;background:rgba(47,158,68,.08);display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:600;color:var(--accent);z-index:60;pointer-events:none}
 .toast{position:fixed;bottom:50px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:9px 16px;border-radius:8px;font-size:14px;z-index:60}
 body.ro aside,body.ro .toolbar,body.ro .edit-only{display:none!important}
 body.ro .main{grid-template-columns:1fr}
@@ -1372,25 +1373,73 @@ $('expXlsx').onclick = exportXlsx;
 $('expCsv').onclick = exportCsv;
 $('expPdf').onclick = () => window.print();
 $('importBtn').onclick = () => $('importFile').click();
-$('importFile').onchange = async e => {
-  const file = e.target.files[0]; e.target.value = ''; if (!file) return;
+const JSZIP_URL = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
+/* Opmaak (vet, kleuren, uitlijning) uit een .xlsx halen: SheetJS leest die niet zelf */
+async function xlsxStyles(buf) {
+  await loadScript(JSZIP_URL); const z = await JSZip.loadAsync(buf);
+  const P = async p => { const f = z.file(p.replace(/^\//, '')); return f ? new DOMParser().parseFromString(await f.async('text'), 'application/xml') : null; };
+  const all = (el, n) => el ? [...el.getElementsByTagNameNS('*', n)] : [], one = (el, n) => all(el, n)[0];
+  const st = await P('xl/styles.xml'); if (!st) return null;
+  const th = await P('xl/theme/theme1.xml'), tc = [];
+  if (th) { const cs = one(th, 'clrScheme'); if (cs) [...cs.children].forEach(c => { const a = one(c, 'srgbClr'), b = one(c, 'sysClr'); tc.push(a ? a.getAttribute('val') : b ? b.getAttribute('lastClr') : null); }); }
+  const IDX = { 8: '000000', 9: 'FFFFFF', 10: 'FF0000', 11: '00FF00', 12: '0000FF', 13: 'FFFF00', 14: 'FF00FF', 15: '00FFFF', 16: '800000', 17: '008000', 18: '000080', 19: '808000', 20: '800080', 21: '008080', 22: 'C0C0C0', 23: '808080' };
+  const color = el => {
+    if (!el) return null; let h = null;
+    if (el.getAttribute('rgb')) h = el.getAttribute('rgb').slice(-6);
+    else if (el.getAttribute('theme') != null) { const i = +el.getAttribute('theme'); h = tc[i < 4 ? [1, 0, 3, 2][i] : i]; }
+    else if (el.getAttribute('indexed') != null) h = IDX[+el.getAttribute('indexed')];
+    if (!h || !/^[0-9a-f]{6}$/i.test(h)) return null;
+    let rgb = [0, 2, 4].map(k => parseInt(h.slice(k, k + 2), 16)); const t = +(el.getAttribute('tint') || 0);
+    if (t) rgb = rgb.map(v => Math.round(t < 0 ? v * (1 + t) : v + (255 - v) * t));
+    return '#' + rgb.map(v => Math.max(0, Math.min(255, v)).toString(16).padStart(2, '0')).join('');
+  };
+  const flag = (f, n) => { const e = one(f, n); return !!e && e.getAttribute('val') !== '0' && e.getAttribute('val') !== 'false' && e.getAttribute('val') !== 'none'; };
+  const fonts = all(one(st, 'fonts'), 'font').map(f => ({ b: flag(f, 'b'), i: flag(f, 'i'), u: flag(f, 'u'), c: color(one(f, 'color')) }));
+  const fills = all(one(st, 'fills'), 'fill').map(f => { const p = one(f, 'patternFill'); return p && p.getAttribute('patternType') === 'solid' ? color(one(p, 'fgColor')) : null; });
+  const xfs = all(one(st, 'cellXfs'), 'xf').map(x => { const a = one(x, 'alignment'), h = a && a.getAttribute('horizontal'); return { font: fonts[+x.getAttribute('fontId') || 0] || {}, bg: fills[+x.getAttribute('fillId') || 0] || null, al: h === 'center' || h === 'centerContinuous' ? 'center' : h === 'right' ? 'right' : h === 'left' ? 'left' : '' }; });
+  const wbx = await P('xl/workbook.xml'), rl = await P('xl/_rels/workbook.xml.rels'), rel = {}, out = {};
+  all(rl, 'Relationship').forEach(r => { const t = r.getAttribute('Target'); rel[r.getAttribute('Id')] = t[0] === '/' ? t.slice(1) : 'xl/' + t; });
+  for (const sh of all(wbx, 'sheet')) {
+    const id = sh.getAttribute('r:id') || [...sh.attributes].find(a => a.localName === 'id' && a.prefix).value, x = rel[id] && await P(rel[id]); if (!x) continue;
+    const m = out[sh.getAttribute('name')] = {};
+    all(x, 'c').forEach(c => { const xi = c.getAttribute('s'); if (xi && xfs[+xi]) m[c.getAttribute('r')] = xfs[+xi]; });
+  }
+  return out;
+}
+function styleOf(xf) {
+  if (!xf) return null; const o = {}, f = xf.font;
+  if (f.b) o.b = true; if (f.i) o.i = true; if (f.u) o.u = true;
+  if (xf.bg && xf.bg !== '#ffffff') o.bg = xf.bg;
+  if (f.c && f.c !== '#000000' && !(f.c === '#ffffff' && !o.bg)) o.c = f.c; else if (o.bg) o.c = '#111111';
+  if (xf.al) o.al = xf.al;
+  return Object.keys(o).length ? o : null;
+}
+const IMPORT_EXT = ['xlsx', 'xlsm', 'xls', 'csv', 'ods'];
+async function importFile(file) {
+  const ext = (file.name.split('.').pop() || '').toLowerCase();
+  if (IMPORT_EXT.indexOf(ext) < 0) return alert('Dit bestandstype kan niet worden geïmporteerd. Kies een Excel-bestand (.xlsx of .xls), .ods of .csv.');
   try { await loadScript(XLSX_URL); } catch (err) { return alert('Kon de Excel-module niet laden. Ben je online?'); }
   setStatus('Importeren...');
   try {
-    const x = XLSX.read(await file.arrayBuffer(), { cellFormula: true });
-    const data = { sheets: [], active: 0 };
+    const buf = await file.arrayBuffer();
+    const x = XLSX.read(buf, { cellFormula: true, cellNF: true });
+    let styles = null; if (ext === 'xlsx' || ext === 'xlsm') { try { styles = await xlsxStyles(buf); } catch (e) { styles = null; } }
+    const data = { sheets: [], active: 0 }, formulas = [];
     x.SheetNames.forEach(name => {
       let nm = name.replace(/[!'\[\]:*?\/\\]/g, '').slice(0, 31) || 'Blad'; const base = nm; let n = 2; while (data.sheets.some(s => s.name.toLowerCase() === nm.toLowerCase())) nm = base + ' ' + n++;
-      const ws = x.Sheets[name], sh = newSheet(nm);
+      const ws = x.Sheets[name], sh = newSheet(nm), sst = styles && styles[name];
       if (ws['!ref']) {
         const rg = XLSX.utils.decode_range(ws['!ref']);
         for (let r = 0; r <= Math.min(rg.e.r, 4999); r++) for (let c = 0; c <= Math.min(rg.e.c, 199); c++) {
-          const cl = ws[XLSX.utils.encode_cell({ r, c })]; if (!cl) continue;
-          let v; if (cl.f) v = '=' + cl.f; else if (cl.t === 'n') v = String(cl.v); else if (cl.t === 'b') v = cl.v ? 'WAAR' : 'ONWAAR'; else if (cl.t === 'e') v = String(cl.w || '#ERROR!'); else v = cl.v == null ? '' : String(cl.v);
-          if (v === '') continue;
+          const ref = XLSX.utils.encode_cell({ r, c }), cl = ws[ref], st = sst ? styleOf(sst[ref]) : null;
+          if (!cl) { if (st && st.bg) sh.cells[addr(r, c)] = { v: '', s: st }; continue; }
+          let v; if (cl.f) v = '=' + cl.f; else if (cl.t === 'n') v = String(cl.v); else if (cl.t === 'b') v = cl.v ? 'WAAR' : 'ONWAAR'; else if (cl.t === 'e') v = String(cl.w || '#ERROR!'); else if (cl.t === 'd') v = String(cl.w || cl.v); else v = cl.v == null ? '' : String(cl.v);
+          if (v === '' && !(st && st.bg)) continue;
           const cell = { v };
-          if (cl.t === 'n' && cl.z) { if (XLSX.SSF.is_date(cl.z)) cell.s = { f: 'date' }; else if (/%/.test(cl.z)) cell.s = { f: 'pct' }; else if (/\u20ac|EUR/.test(cl.z)) cell.s = { f: 'eur' }; }
+          if (st) cell.s = Object.assign({}, st);
+          if (cl.t === 'n' && cl.z && cl.z !== 'General') { const f = XLSX.SSF.is_date(cl.z) ? (/h/i.test(cl.z.replace(/"[^"]*"/g, '')) ? 'datetime' : 'date') : /%/.test(cl.z) ? 'pct' : /€|EUR/.test(cl.z) ? 'eur' : /0\.00/.test(cl.z) ? 'num2' : /#,##0/.test(cl.z) ? 'num0' : ''; if (f) cell.s = Object.assign(cell.s || {}, { f }); }
           sh.cells[addr(r, c)] = cell;
+          if (cl.f) formulas.push({ sh, r, c, cl });
         }
         sh.rows = Math.max(100, Math.min(5000, rg.e.r + 21)); sh.cols = Math.max(26, Math.min(200, rg.e.c + 3));
         if (ws['!cols']) ws['!cols'].forEach((ci, c) => { if (ci && ci.wpx) sh.colW[c] = Math.round(ci.wpx); else if (ci && ci.wch) sh.colW[c] = Math.round(ci.wch * 7 + 10); });
@@ -1398,9 +1447,24 @@ $('importFile').onchange = async e => {
       data.sheets.push(sh);
     });
     if (!data.sheets.length) data.sheets.push(newSheet('Blad1'));
-    await saveNow(); await createBook(file.name.replace(/\.[^.]+$/, ''), data); toast('Ge\u00efmporteerd!');
-  } catch (err) { setStatus(''); alert('Dit bestand kon niet worden gelezen.'); }
-};
+    /* Formules die jf.cells (nog) niet kent: zet dan de uitkomst uit Excel neer, zodat je geen #NAAM? ziet */
+    let fixed = 0;
+    if (formulas.length) {
+      const prev = wb; wb = data; recalcReset();
+      formulas.forEach(({ sh, r, c, cl }) => { let v; try { v = cellValue(sh, r, c); } catch (e) { v = new FErr('#ERROR!'); } if (v instanceof FErr && cl.t !== 'e') { const cell = sh.cells[addr(r, c)]; cell.v = cl.t === 'b' ? (cl.v ? 'WAAR' : 'ONWAAR') : cl.v == null ? '' : String(cl.v); fixed++; } });
+      wb = prev; recalcReset();
+    }
+    await saveNow(); await createBook(file.name.replace(/\.[^.]+$/, ''), data);
+    toast(fixed ? 'Geïmporteerd! (' + fixed + ' formule' + (fixed === 1 ? '' : 's') + ' als vaste waarde overgenomen)' : 'Geïmporteerd!');
+  } catch (err) { console.error(err); setStatus(''); alert('Dit bestand kon niet worden gelezen. Is het misschien beveiligd met een wachtwoord?'); }
+}
+$('importFile').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) importFile(f); };
+let dragN = 0;
+const dropOk = e => currentUser && e.dataTransfer && [...e.dataTransfer.types].indexOf('Files') >= 0 && !$('app').classList.contains('hidden');
+document.addEventListener('dragenter', e => { if (!dropOk(e)) return; dragN++; if (!$('dropzone')) { const d = document.createElement('div'); d.id = 'dropzone'; d.className = 'dropzone'; d.textContent = 'Laat los om te importeren'; document.body.append(d); } });
+document.addEventListener('dragleave', e => { if (!dropOk(e)) return; dragN = Math.max(0, dragN - 1); if (!dragN && $('dropzone')) $('dropzone').remove(); });
+document.addEventListener('dragover', e => { if (dropOk(e)) e.preventDefault(); });
+document.addEventListener('drop', e => { dragN = 0; if ($('dropzone')) $('dropzone').remove(); if (!dropOk(e)) return; e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) importFile(f); });
 
 /* ---------- Sneltoetsen ---------- */
 document.addEventListener('keydown', e => {
